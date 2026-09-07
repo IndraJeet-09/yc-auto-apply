@@ -1,0 +1,19 @@
+{
+  "name": "yc-auto-apply",
+  "version": "1.0.0",
+  "description": "Auto-apply to YC startup jobs on workatastartup.com using Playwright",
+  "main": "auto-apply-runner.js",
+  "scripts": {
+    "login": "node auto-apply-runner.js yc login",
+    "dry": "node auto-apply-runner.js yc",
+    "live": "node auto-apply-runner.js yc --live"
+  },
+  "keywords": ["yc", "ycombinator", "auto-apply", "playwright", "jobs"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "playwright-core": "^1.61.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

@@ -1,0 +1,7 @@
+node_modules/
+.env
+apply-state-yc.json
+applications.csv
+auto-apply-yc.log
+cron.log
+.yc-chrome-profile/
