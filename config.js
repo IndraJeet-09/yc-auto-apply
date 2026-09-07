@@ -58,5 +58,6 @@ const CV = {
 };
 
 const geminiKey = get('GEMINI_KEY');
+const remoteOnly = get('REMOTE_ONLY', 'true') !== 'false';
 
-module.exports = { CV, geminiKey };
+module.exports = { CV, geminiKey, remoteOnly };
