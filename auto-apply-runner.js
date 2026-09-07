@@ -35,7 +35,7 @@ function loadState() {
       const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
       if (s.date === new Date().toDateString()) return s;
     }
-  } catch {}
+  } catch { }
   return { date: new Date().toDateString(), count: 0, seen: [] };
 }
 function saveState(s) {
@@ -63,18 +63,33 @@ const TITLE_KEYWORDS = [
   'devops', 'sre', 'infrastructure', 'mobile', 'ios', 'android',
   'data engineer', 'founding engineer', 'staff engineer',
   'founding', 'product engineer', 'member of technical staff',
+  'intern', 'internship', 'trainee', 'ux', 'ui'
 ];
 const TITLE_BLOCKLIST = [
-  'intern', 'internship', 'trainee',
+  // Experience-level skip (user has 3 years, skip senior+ roles)
+  'senior', 'sr.', 'sr ', 'staff', 'principal', 'distinguished',
+  'lead', 'head of', 'director', 'vp', 'vice president',
+  'engineering manager', 'tech lead', 'team lead',
+  // Role-type skip
   'sales', 'marketing', 'growth', 'content',
-  'design', 'ux', 'ui',
-  'hr', 'recruiter', 'talent', 'finance', 'legal', 'executive',
+  'design', 'hr', 'recruiter', 'talent', 'finance', 'legal', 'executive',
 ];
 
 function matchesTitle(title) {
   const t = title.toLowerCase();
   if (TITLE_BLOCKLIST.some(b => t.includes(b))) return false;
   return TITLE_KEYWORDS.some(k => t.includes(k));
+}
+
+// ── Experience filtering ─────────────────────────────────────
+const USER_EXPERIENCE = parseInt(CV.yearsExperience || '0', 10);
+const MAX_ALLOWED_YEARS = USER_EXPERIENCE + 1; // e.g., user has 3 yrs → skip jobs requiring 5+
+
+function parseExperienceYears(pageText) {
+  // Look for patterns like "5+ years", "3+ Years", "8+ years of experience"
+  const match = pageText.match(/(\d+)\+?\s*(?:years?|yrs?)/i);
+  if (match) return parseInt(match[1], 10);
+  return null;
 }
 
 // ── Location filtering ───────────────────────────────────────
@@ -248,8 +263,8 @@ async function loginFlow() {
   const page = context.pages()[0] || await context.newPage();
   await page.goto('https://www.workatastartup.com/jobs', { waitUntil: 'domcontentloaded' });
   log('Chrome opened. Please log in to workatastartup.com, then close the window.');
-  await page.waitForEvent('close', { timeout: 300_000 }).catch(() => {});
-  await context.close().catch(() => {});
+  await page.waitForEvent('close', { timeout: 300_000 }).catch(() => { });
+  await context.close().catch(() => { });
   log('Login session saved.');
 }
 
@@ -423,6 +438,18 @@ async function applyToJob(page, job, state) {
     await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2000 + Math.random() * 2000);
 
+    // ── Experience check: read metadata section for "X+ years" ──
+    const pageText = await page.evaluate(() => document.body.innerText.slice(0, 1500));
+    const requiredYears = parseExperienceYears(pageText);
+    if (requiredYears !== null && requiredYears > MAX_ALLOWED_YEARS) {
+      log(`  🚫 requires ${requiredYears}+ years (you have ${USER_EXPERIENCE}) — skipping`);
+      state.seen.push(job.slug);
+      return false;
+    }
+    if (requiredYears !== null) {
+      log(`  ✓ experience OK: requires ${requiredYears}+ years`);
+    }
+
     // Find and click the apply/contact button
     const clicked = await page.evaluate(() => {
       const btns = document.querySelectorAll('a, button');
@@ -581,7 +608,7 @@ async function run() {
   const jobs = await fetchJobs(page);
   if (jobs.length === 0) {
     log('No matching jobs found. Done.');
-    await context.close().catch(() => {});
+    await context.close().catch(() => { });
     return;
   }
 
@@ -622,7 +649,7 @@ async function run() {
     logToCSV({ role: 'YC Jobs', company: 'Various', url: 'https://www.workatastartup.com/jobs', skills: CV.skills.slice(0, 5), desc: `Applied to ${appliedCount} jobs` });
   }
 
-  await context.close().catch(() => {});
+  await context.close().catch(() => { });
   log('Browser closed.');
 }
 
