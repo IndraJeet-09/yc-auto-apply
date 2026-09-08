@@ -3,14 +3,13 @@
 
 const fs = require('fs');
 const path = require('path');
-const { CV, geminiKey, remoteOnly } = require('./config');
+const { CV, geminiKey } = require('./config');
 
 // ── CLI args ─────────────────────────────────────────────────
 const mode = process.argv.includes('--live') ? 'LIVE' : 'DRY_RUN';
 const DRY_RUN = mode === 'DRY_RUN';
 const MAX_APPLICATIONS = parseInt(process.env.MAX_APPS || '50', 10);
 const MAX_RUNTIME_MS = 100 * 60 * 1000;
-const REMOTE_ONLY = remoteOnly;
 
 const CHROME_PATH = process.env.CHROME_PATH || '';
 const PROFILE_DIR = path.join(__dirname, '.yc-chrome-profile');
@@ -54,32 +53,8 @@ function logToCSV(data) {
   fs.appendFileSync(CSV_FILE, row + '\n');
 }
 
-// ── Title filtering ──────────────────────────────────────────
-const TITLE_KEYWORDS = [
-  'full stack', 'fullstack', 'full-stack',
-  'backend', 'back-end', 'software engineer', 'software developer',
-  'frontend', 'front-end', 'react', 'node', 'python', 'typescript',
-  'javascript', 'ai engineer', 'ml engineer', 'machine learning',
-  'devops', 'sre', 'infrastructure', 'mobile', 'ios', 'android',
-  'data engineer', 'founding engineer', 'staff engineer',
-  'founding', 'product engineer', 'member of technical staff',
-  'intern', 'internship', 'trainee', 'ux', 'ui'
-];
-const TITLE_BLOCKLIST = [
-  // Experience-level skip (user has 3 years, skip senior+ roles)
-  'senior', 'sr.', 'sr ', 'staff', 'principal', 'distinguished',
-  'lead', 'head of', 'director', 'vp', 'vice president',
-  'engineering manager', 'tech lead', 'team lead',
-  // Role-type skip
-  'sales', 'marketing', 'growth', 'content',
-  'design', 'hr', 'recruiter', 'talent', 'finance', 'legal', 'executive',
-];
-
-function matchesTitle(title) {
-  const t = title.toLowerCase();
-  if (TITLE_BLOCKLIST.some(b => t.includes(b))) return false;
-  return TITLE_KEYWORDS.some(k => t.includes(k));
-}
+// ── Companies URL (filters applied server-side) ──────────────
+const COMPANIES_URL = 'https://www.workatastartup.com/companies?demographic=any&hasEquity=any&hasSalary=any&industry=any&interviewProcess=any&jobType=any&layout=list-compact&minExperience=0&minExperience=1&remote=only&role=eng&role_type=fs&role_type=be&role_type=fe&role_type=embedded&role_type=data_sci&sortBy=created_desc&tab=any&usVisaNotRequired=any';
 
 // ── Experience filtering ─────────────────────────────────────
 const USER_EXPERIENCE = parseInt(CV.yearsExperience || '0', 10);
@@ -90,25 +65,6 @@ function parseExperienceYears(pageText) {
   const match = pageText.match(/(\d+)\+?\s*(?:years?|yrs?)/i);
   if (match) return parseInt(match[1], 10);
   return null;
-}
-
-// ── Location filtering ───────────────────────────────────────
-function extractLocation(cardText) {
-  // Card text looks like: "Company (S14)•desc Title FulltimeRemote (US)Full stack$124K"
-  // or: "Company FulltimeSan Francisco, CA, USFull stack$192K"
-  // or: "Company FulltimeCA / Remote (CA)Machine learning$124K"
-  const ftMatch = cardText.match(/(fulltime|parttime)\s*(.*?)(fullstack|backend|frontend|machine learning|data|infrastructure|hardware|ios|android|mobile|devops|sre|$)/i);
-  if (ftMatch) {
-    const between = ftMatch[2].trim();
-    if (between) return between;
-  }
-  // Fallback: look for common location patterns
-  const locMatch = cardText.match(/(remote\s*\([^)]*\)|[a-z\s]+,\s*[a-z]{2},\s*[a-z]{2}|remote)/i);
-  return locMatch ? locMatch[0] : '';
-}
-
-function isRemoteJob(location) {
-  return /remote/i.test(location);
 }
 
 // ── Gemini AI ────────────────────────────────────────────────
@@ -143,61 +99,66 @@ Question: ${question}`;
   }
 }
 
-// ── Job scraping from DOM ────────────────────────────────────
+// ── Job scraping from companies page DOM ─────────────────────
 async function scrapeJobsFromPage(page) {
   return page.evaluate(() => {
     const jobs = [];
-    const jobLinks = document.querySelectorAll('a[href^="/jobs/"]');
+    const jobLinks = document.querySelectorAll('a[href*="/jobs/"]');
 
     for (const link of jobLinks) {
       const title = link.textContent.trim();
-      if (!title || title.length < 5) continue;
+      if (!title || title.length < 3) continue;
+      if (title === 'View job') continue;
 
       const href = link.getAttribute('href') || '';
       const slugMatch = href.match(/\/jobs\/(\d+)/);
       if (!slugMatch) continue;
       const slug = slugMatch[1];
-      const url = `https://www.workatastartup.com${href}`;
+      const url = href.startsWith('http') ? href : `https://www.workatastartup.com${href}`;
 
-      let card = link.closest('.flex.h-full') || link.parentElement?.parentElement?.parentElement;
-      const cardText = card ? card.textContent.toLowerCase() : '';
-
+      // Walk up to the company container (bg-beige-lighter with mb-5 = company wrapper)
       let company = '';
-      if (card) {
-        const allText = card.innerText;
-        const lines = allText.split('\n').map(l => l.trim()).filter(Boolean);
-        for (const line of lines) {
-          if (line !== title && !line.match(/^(Fulltime|Parttime|Intern|Remote|Apply|\$|CA|US|IN|Remote|San|New)/i) && line.length > 1 && line.length < 80) {
-            company = line.split('•')[0].trim();
-            break;
+      let el = link;
+      for (let i = 0; i < 15; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        const cls = el.className || '';
+        // The company container has bg-beige-lighter AND mb-5 (the job card only has bg-beige-lighter)
+        if (cls.includes('bg-beige-lighter') && cls.includes('mb-5')) {
+          const lines = el.innerText.split('\n').map(l => l.trim()).filter(Boolean);
+          if (lines.length > 0) {
+            company = lines[0].replace(/\(.*\)$/, '').trim();
           }
+          break;
         }
       }
 
-      jobs.push({ title, company, url, slug, text: cardText });
+      jobs.push({ title, company, url, slug });
     }
     return jobs;
   });
 }
 
 async function fetchJobs(page) {
-  log('Scraping jobs from page...');
+  log('Fetching companies from filtered URL...');
 
-  await page.goto('https://www.workatastartup.com/jobs', { waitUntil: 'networkidle', timeout: 60000 });
-  await page.waitForTimeout(3000);
+  await page.goto(COMPANIES_URL, { waitUntil: 'networkidle', timeout: 60000 });
+  await page.waitForTimeout(4000);
 
-  for (let i = 0; i < 5; i++) {
+  // Scroll to load all company entries
+  for (let i = 0; i < 10; i++) {
     await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
     await page.waitForTimeout(1500);
-    log(`  scroll ${i + 1}/5`);
+    log(`  scroll ${i + 1}/10`);
   }
 
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.waitForTimeout(1000);
 
   const allJobs = await scrapeJobsFromPage(page);
-  log(`  scraped ${allJobs.length} job cards from page`);
+  log(`  scraped ${allJobs.length} job links from companies page`);
 
+  // Deduplicate by slug
   const seen = new Set();
   const unique = allJobs.filter(j => {
     if (seen.has(j.slug)) return false;
@@ -205,26 +166,8 @@ async function fetchJobs(page) {
     return true;
   });
 
-  const filtered = unique.filter(job => {
-    if (!matchesTitle(job.title)) return false;
-    return true;
-  });
-
-  // Location filtering
-  if (REMOTE_ONLY) {
-    const beforeCount = filtered.length;
-    const remoteJobs = filtered.filter(job => {
-      const loc = extractLocation(job.text);
-      return isRemoteJob(loc);
-    });
-    const skipped = beforeCount - remoteJobs.length;
-    if (skipped > 0) log(`  🚫 skipped ${skipped} non-remote jobs`);
-    log(`Found ${remoteJobs.length} matching remote jobs out of ${unique.length} unique`);
-    return remoteJobs;
-  }
-
-  log(`Found ${filtered.length} matching jobs out of ${unique.length} unique`);
-  return filtered;
+  log(`Found ${unique.length} unique jobs to apply`);
+  return unique;
 }
 
 // ── Browser launch ───────────────────────────────────────────
@@ -261,7 +204,7 @@ async function loginFlow() {
   log('Starting login flow...');
   const context = await launchBrowser();
   const page = context.pages()[0] || await context.newPage();
-  await page.goto('https://www.workatastartup.com/jobs', { waitUntil: 'domcontentloaded' });
+  await page.goto(COMPANIES_URL, { waitUntil: 'domcontentloaded' });
   log('Chrome opened. Please log in to workatastartup.com, then close the window.');
   await page.waitForEvent('close', { timeout: 300_000 }).catch(() => { });
   await context.close().catch(() => { });
@@ -600,7 +543,7 @@ async function run() {
     return;
   }
 
-  log(`Starting. mode=${DRY_RUN ? 'DRY_RUN' : 'LIVE'} target=${remaining} applications, remote_only=${REMOTE_ONLY}`);
+  log(`Starting. mode=${DRY_RUN ? 'DRY_RUN' : 'LIVE'} target=${remaining} applications`);
 
   const context = await launchBrowser();
   const page = context.pages()[0] || await context.newPage();
@@ -646,7 +589,7 @@ async function run() {
   log(`Run complete. Applied to ${appliedCount} jobs. Total today: ${state.count}/${MAX_APPLICATIONS}`);
 
   if (!DRY_RUN && appliedCount > 0) {
-    logToCSV({ role: 'YC Jobs', company: 'Various', url: 'https://www.workatastartup.com/jobs', skills: CV.skills.slice(0, 5), desc: `Applied to ${appliedCount} jobs` });
+    logToCSV({ role: 'YC Jobs', company: 'Various', url: COMPANIES_URL, skills: CV.skills.slice(0, 5), desc: `Applied to ${appliedCount} jobs` });
   }
 
   await context.close().catch(() => { });
