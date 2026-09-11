@@ -1,8 +1,8 @@
 [Unit]
-Description=Run YC Auto Apply daily at 18:30 IST (9:00 AM ET / 3:00 PM CET)
+Description=Run YC Auto Apply weekly on Monday at 18:30 IST (9:00 AM ET / 3:00 PM CET)
 
 [Timer]
-OnCalendar=*-*-* 18:30:00
+OnCalendar=Mon *-*-* 18:30:00
 Persistent=true
 RandomizedDelaySec=0
 

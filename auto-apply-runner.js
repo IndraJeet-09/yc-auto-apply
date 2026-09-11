@@ -8,10 +8,14 @@ const { CV, geminiKey } = require('./config');
 // ── CLI args ─────────────────────────────────────────────────
 const mode = process.argv.includes('--live') ? 'LIVE' : 'DRY_RUN';
 const DRY_RUN = mode === 'DRY_RUN';
-const MAX_APPLICATIONS = parseInt(process.env.MAX_APPS || '50', 10);
+const FORCE_MODE = process.argv.includes('--force');
+const TEST_JOB_URL = process.argv.includes('--test-job')
+  ? process.argv[process.argv.indexOf('--test-job') + 1]
+  : null;
+
+const YC_WEEKLY_LIMIT = 5;
 const MAX_RUNTIME_MS = 100 * 60 * 1000;
 
-const CHROME_PATH = process.env.CHROME_PATH || '';
 const PROFILE_DIR = path.join(__dirname, '.yc-chrome-profile');
 const LOG_FILE = path.join(__dirname, 'auto-apply-yc.log');
 const STATE_FILE = path.join(__dirname, 'apply-state-yc.json');
@@ -27,18 +31,55 @@ function log(msg) {
   fs.appendFileSync(LOG_FILE, line + '\n');
 }
 
-// ── State ────────────────────────────────────────────────────
+// ── State (weekly tracking) ──────────────────────────────────
+function getWeekStart() {
+  const now = new Date();
+  const day = now.getDay();
+  const diff = now.getDate() - day + (day === 0 ? -6 : 1);
+  const monday = new Date(now);
+  monday.setDate(diff);
+  monday.setHours(0, 0, 0, 0);
+  return monday.toISOString().split('T')[0];
+}
+
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
-      if (s.date === new Date().toDateString()) return s;
+      const currentWeek = getWeekStart();
+      if (s.weekStart === currentWeek) return s;
+      return {
+        weekStart: currentWeek,
+        weeklyCount: 0,
+        appliedJobs: s.appliedJobs || [],
+        seen: [],
+      };
     }
   } catch { }
-  return { date: new Date().toDateString(), count: 0, seen: [] };
+  return {
+    weekStart: getWeekStart(),
+    weeklyCount: 0,
+    appliedJobs: [],
+    seen: [],
+  };
 }
+
 function saveState(s) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+}
+
+function hasAppliedToJob(state, jobId) {
+  return state.appliedJobs.some(j => j.id === jobId);
+}
+
+function markApplied(state, job) {
+  state.appliedJobs.push({
+    id: job.slug,
+    company: job.company,
+    title: job.title,
+    appliedAt: new Date().toISOString(),
+  });
+  state.weeklyCount++;
 }
 
 // ── CSV ──────────────────────────────────────────────────────
@@ -53,15 +94,14 @@ function logToCSV(data) {
   fs.appendFileSync(CSV_FILE, row + '\n');
 }
 
-// ── Companies URL (filters applied server-side) ──────────────
+// ── Companies URL ────────────────────────────────────────────
 const COMPANIES_URL = 'https://www.workatastartup.com/companies?demographic=any&hasEquity=any&hasSalary=any&industry=any&interviewProcess=any&jobType=any&layout=list-compact&minExperience=0&minExperience=1&remote=only&role=eng&role_type=fs&role_type=be&role_type=fe&role_type=embedded&role_type=data_sci&sortBy=created_desc&tab=any&usVisaNotRequired=any';
 
 // ── Experience filtering ─────────────────────────────────────
 const USER_EXPERIENCE = parseInt(CV.yearsExperience || '0', 10);
-const MAX_ALLOWED_YEARS = USER_EXPERIENCE + 1; // e.g., user has 3 yrs → skip jobs requiring 5+
+const MAX_ALLOWED_YEARS = USER_EXPERIENCE + 1;
 
 function parseExperienceYears(pageText) {
-  // Look for patterns like "5+ years", "3+ Years", "8+ years of experience"
   const match = pageText.match(/(\d+)\+?\s*(?:years?|yrs?)/i);
   if (match) return parseInt(match[1], 10);
   return null;
@@ -116,14 +156,12 @@ async function scrapeJobsFromPage(page) {
       const slug = slugMatch[1];
       const url = href.startsWith('http') ? href : `https://www.workatastartup.com${href}`;
 
-      // Walk up to the company container (bg-beige-lighter with mb-5 = company wrapper)
       let company = '';
       let el = link;
       for (let i = 0; i < 15; i++) {
         el = el.parentElement;
         if (!el) break;
         const cls = el.className || '';
-        // The company container has bg-beige-lighter AND mb-5 (the job card only has bg-beige-lighter)
         if (cls.includes('bg-beige-lighter') && cls.includes('mb-5')) {
           const lines = el.innerText.split('\n').map(l => l.trim()).filter(Boolean);
           if (lines.length > 0) {
@@ -145,7 +183,6 @@ async function fetchJobs(page) {
   await page.goto(COMPANIES_URL, { waitUntil: 'networkidle', timeout: 60000 });
   await page.waitForTimeout(4000);
 
-  // Scroll to load all company entries
   for (let i = 0; i < 10; i++) {
     await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
     await page.waitForTimeout(1500);
@@ -158,7 +195,6 @@ async function fetchJobs(page) {
   const allJobs = await scrapeJobsFromPage(page);
   log(`  scraped ${allJobs.length} job links from companies page`);
 
-  // Deduplicate by slug
   const seen = new Set();
   const unique = allJobs.filter(j => {
     if (seen.has(j.slug)) return false;
@@ -225,7 +261,11 @@ async function fillByLabel(page, labelText, value) {
       el.dispatchEvent(new Event('blur', { bubbles: true }));
     }
 
-    const labels = document.querySelectorAll('label, [role="label"], span, p');
+    const modal = document.querySelector(
+      '[role="dialog"], .modal, [data-modal], [data-controller*="modal"], [class*="modal"]'
+    ) || document;
+
+    const labels = modal.querySelectorAll('label, [role="label"], span, p');
     for (const lbl of labels) {
       const text = (lbl.textContent || '').toLowerCase();
       if (!text.includes(label.toLowerCase())) continue;
@@ -252,9 +292,12 @@ async function fillByLabel(page, labelText, value) {
 
 // ── Fill work authorization checkbox ─────────────────────────
 async function fillWorkAuth(page) {
-  return page.evaluate((workAuth) => {
-    const labels = [...document.querySelectorAll('label')];
-    // Find the "no sponsorship needed in US" checkbox
+  return page.evaluate(() => {
+    const modal = document.querySelector(
+      '[role="dialog"], .modal, [data-modal], [data-controller*="modal"], [class*="modal"]'
+    ) || document;
+
+    const labels = [...modal.querySelectorAll('label')];
     const usAuthLabel = labels.find(l => {
       const t = l.textContent.toLowerCase();
       return t.includes('authorized to work') && t.includes('without sponsorship') && t.includes('united states');
@@ -269,7 +312,7 @@ async function fillWorkAuth(page) {
       if (checkbox?.checked) return 'US-no-sponsorship-already';
     }
     return null;
-  }, CV.workAuth);
+  });
 }
 
 // ── Detect and fill all required fields ──────────────────────
@@ -278,8 +321,11 @@ async function fillRequiredFields(page, job) {
     const filled = [];
     const skipped = [];
 
-    // Find all labels with * (required markers)
-    const allLabels = [...document.querySelectorAll('label, p, span, div')];
+    const modal = document.querySelector(
+      '[role="dialog"], .modal, [data-modal], [data-controller*="modal"], [class*="modal"]'
+    ) || document;
+
+    const allLabels = [...modal.querySelectorAll('label, p, span, div')];
     const requiredLabels = allLabels.filter(l => {
       const text = l.textContent || '';
       return text.includes('*') && text.length > 3 && text.length < 200;
@@ -289,7 +335,6 @@ async function fillRequiredFields(page, job) {
       const labelText = label.textContent.trim().replace(/\*/g, '').trim();
       const labelTextLower = labelText.toLowerCase();
 
-      // Find the associated input
       const forId = label.getAttribute('for');
       let input = forId ? document.getElementById(forId) : null;
       if (!input) {
@@ -298,7 +343,6 @@ async function fillRequiredFields(page, job) {
       }
       if (!input) continue;
 
-      // Skip if already filled
       if (input.tagName === 'TEXTAREA' && input.value.length > 10) {
         filled.push(labelText.slice(0, 40) + ' (already filled)');
         continue;
@@ -312,7 +356,6 @@ async function fillRequiredFields(page, job) {
         continue;
       }
 
-      // Map common required fields
       const answers = {
         'name': cv.name,
         'email': cv.email,
@@ -321,14 +364,14 @@ async function fillRequiredFields(page, job) {
         'github': cv.github,
         'website': cv.portfolio,
         'portfolio': cv.portfolio,
-        'resume': cv.portfolio || cv.github, // can't upload file, provide link
+        'resume': cv.portfolio || cv.github,
         'cover': `Dear Hiring Manager,\n\nI'm excited about the ${jobTitle} role at ${jobCompany}. With ${cv.yearsExperience} years of experience in ${cv.skills.slice(0, 3).join(', ')}, I believe I can make a significant impact.\n\n${cv.highlights[0] ? `For example, ${cv.highlights[0]}.` : ''}\n\nI'm passionate about building scalable products in fast-paced startup environments and would love to contribute to ${jobCompany}'s mission.\n\nBest regards,\n${cv.name}`,
         'message': `Dear Hiring Manager,\n\nI'm excited about the ${jobTitle} role at ${jobCompany}. With ${cv.yearsExperience} years of experience in ${cv.skills.slice(0, 3).join(', ')}, I believe I can make a significant impact.\n\nI'm passionate about building scalable products in fast-paced startup environments.\n\nBest regards,\n${cv.name}`,
         'why': `I'm excited about ${jobCompany}'s innovative work. My background in ${cv.skills.slice(0, 3).join(', ')} with ${cv.yearsExperience} years of experience aligns well with this role.`,
         'interest': `I'm drawn to ${jobCompany}'s mission and believe my skills in ${cv.skills.slice(0, 3).join(', ')} can make a real impact.`,
         'experience': `I'm a ${cv.currentRole} with ${cv.yearsExperience} years of experience at ${cv.company}. My core skills include ${cv.skills.slice(0, 5).join(', ')}.`,
-        'salary': 'Competitive with market rate — open to discussion.',
-        'compensation': 'Competitive with market rate — open to discussion.',
+        'salary': 'Competitive with market rate -- open to discussion.',
+        'compensation': 'Competitive with market rate -- open to discussion.',
         'start': `Available to start within ${cv.noticePeriod}.`,
         'available': `Available to start within ${cv.noticePeriod}.`,
         'notice': `Available to start within ${cv.noticePeriod}.`,
@@ -371,57 +414,160 @@ async function fillRequiredFields(page, job) {
 
 // ── Apply to a single job ───────────────────────────────────
 async function applyToJob(page, job, state) {
-  if (state.seen.includes(job.slug)) {
-    log(`  ⏭ already seen: ${job.company} — skipping`);
+  if (hasAppliedToJob(state, job.slug)) {
+    log(`  already applied this week (id: ${job.slug}) -- skipping`);
     return false;
   }
 
-  log(`Opening: ${job.company} — ${job.title}`);
+  if (state.seen.includes(job.slug)) {
+    log(`  already seen this run -- skipping`);
+    return false;
+  }
+
+  log(`Opening: ${job.company} -- ${job.title}`);
   try {
     await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2000 + Math.random() * 2000);
 
-    // ── Experience check: read metadata section for "X+ years" ──
+    // ── Experience check ──
     const pageText = await page.evaluate(() => document.body.innerText.slice(0, 1500));
     const requiredYears = parseExperienceYears(pageText);
     if (requiredYears !== null && requiredYears > MAX_ALLOWED_YEARS) {
-      log(`  🚫 requires ${requiredYears}+ years (you have ${USER_EXPERIENCE}) — skipping`);
+      log(`  requires ${requiredYears}+ years (you have ${USER_EXPERIENCE}) -- skipping`);
       state.seen.push(job.slug);
       return false;
     }
     if (requiredYears !== null) {
-      log(`  ✓ experience OK: requires ${requiredYears}+ years`);
+      log(`  experience OK: requires ${requiredYears}+ years`);
     }
 
-    // Find and click the apply/contact button
-    const clicked = await page.evaluate(() => {
-      const btns = document.querySelectorAll('a, button');
-      for (const btn of btns) {
-        const t = (btn.textContent || '').toLowerCase().trim();
-        if (t.includes('apply') || t.includes('contact') || t.includes('reach out')) {
-          if (btn.getClientRects().length > 0) {
-            btn.click();
-            return t;
-          }
+    // ── Check if already applied ──
+    const alreadyApplied = await page.evaluate(() => {
+      const allElements = document.querySelectorAll('a, button, span, div');
+      for (const el of allElements) {
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t === 'applied' || t === 'applied \u2713' || t === 'applied \u2714') {
+          if (el.getClientRects().length > 0) return true;
         }
       }
-      return null;
+      return false;
     });
-
-    if (!clicked) {
-      log('  ⚠ no apply button found — skipping');
+    if (alreadyApplied) {
+      log(`  already applied -- skipping`);
+      state.seen.push(job.slug);
       return false;
     }
-    log(`  clicked: "${clicked}"`);
-    await page.waitForTimeout(2000);
+
+    // ── Find and click apply button ──
+    const clicked = await page.evaluate(() => {
+      const btns = [...document.querySelectorAll('a, button')];
+
+      const isMailto = (el) => {
+        const href = el.getAttribute('href') || '';
+        return href.startsWith('mailto:');
+      };
+
+      const isVisible = (el) => el.getClientRects().length > 0;
+
+      // Pass 1: find "apply" button (not mailto)
+      for (const btn of btns) {
+        const t = (btn.textContent || '').toLowerCase().trim();
+        if (t.includes('apply') && !isMailto(btn) && isVisible(btn)) {
+          btn.click();
+          return { text: t, type: 'apply' };
+        }
+      }
+
+      // Pass 2: find "submit" button (not mailto)
+      for (const btn of btns) {
+        const t = (btn.textContent || '').toLowerCase().trim();
+        if (t.includes('submit') && !isMailto(btn) && isVisible(btn)) {
+          btn.click();
+          return { text: t, type: 'submit' };
+        }
+      }
+
+      // Pass 3: find "contact" button only if NOT a mailto link
+      for (const btn of btns) {
+        const t = (btn.textContent || '').toLowerCase().trim();
+        if ((t.includes('contact') || t.includes('reach out')) && !isMailto(btn) && isVisible(btn)) {
+          btn.click();
+          return { text: t, type: 'contact' };
+        }
+      }
+
+      // Pass 4: find external ATS links
+      for (const btn of btns) {
+        const href = (btn.getAttribute('href') || '').toLowerCase();
+        const t = (btn.textContent || '').toLowerCase().trim();
+        if (isVisible(btn) && (href.includes('typeform') || href.includes('lever') || href.includes('greenhouse') || href.includes('ashby') || href.includes('apply') || href.includes('jobs/apply'))) {
+          btn.click();
+          return { text: t || href.slice(0, 50), type: 'external-form' };
+        }
+      }
+
+      // Pass 5: find Stimulus modal buttons
+      for (const btn of btns) {
+        const controller = btn.getAttribute('data-controller') || '';
+        const action = btn.getAttribute('data-action') || '';
+        if (isVisible(btn) && (controller.includes('modal') || action.includes('modal'))) {
+          btn.click();
+          return { text: (btn.textContent || '').trim().slice(0, 50), type: 'stimulus-modal' };
+        }
+      }
+
+      return { text: null, type: null };
+    });
+
+    if (!clicked || !clicked.text) {
+      log('  no apply button found -- skipping');
+      return false;
+    }
+    log(`  clicked: "${clicked.text}" (type: ${clicked.type})`);
+
+    if (clicked.type === 'external-form') {
+      log('  waiting for external form page to load...');
+      try {
+        await page.waitForTimeout(5000);
+      } catch (e) {
+        log(`  navigation interrupted: ${e.message}`);
+        return false;
+      }
+    } else {
+      // Wait for modal/form to appear
+      try {
+        await page.waitForSelector(
+          '[role="dialog"], .modal, [data-modal], [data-controller*="modal"], [class*="modal"]',
+          { timeout: 3000 }
+        ).catch(() => {});
+        const hasModal = await page.evaluate(() => {
+          return !!document.querySelector(
+            '[role="dialog"], .modal, [data-modal], [data-controller*="modal"], [class*="modal"]'
+          );
+        });
+        if (hasModal) {
+          log('  modal detected after click');
+        } else {
+          await page.waitForTimeout(1000);
+        }
+      } catch (e) {
+        log(`  page closed after click: ${e.message}`);
+        return false;
+      }
+    }
 
     // Fill basic fields
-    await fillByLabel(page, 'name', CV.name);
-    await fillByLabel(page, 'email', CV.email);
-    await fillByLabel(page, 'phone', CV.phone);
-    await fillByLabel(page, 'linkedin', CV.linkedin);
-    await fillByLabel(page, 'github', CV.github);
-    await fillByLabel(page, 'website', CV.portfolio);
+    try {
+      await fillByLabel(page, 'name', CV.name);
+      await fillByLabel(page, 'email', CV.email);
+      await fillByLabel(page, 'phone', CV.phone);
+      await fillByLabel(page, 'linkedin', CV.linkedin);
+      await fillByLabel(page, 'github', CV.github);
+      await fillByLabel(page, 'website', CV.portfolio);
+    } catch (e) {
+      log(`  form filling error (page may have navigated): ${e.message}`);
+      return false;
+    }
 
     // Fill cover letter / message
     const coverLetter = `Dear Hiring Manager,
@@ -440,23 +586,22 @@ ${CV.name}`;
 
     // Fill work authorization checkbox
     const authResult = await fillWorkAuth(page);
-    if (authResult) log(`  ✓ work auth: ${authResult}`);
+    if (authResult) log(`  work auth: ${authResult}`);
 
     // Detect and fill all required fields
     const reqResult = await fillRequiredFields(page, job);
     if (reqResult.filled.length > 0) {
-      log(`  ✓ filled ${reqResult.filled.length} required fields`);
+      log(`  filled ${reqResult.filled.length} required fields`);
     }
     if (reqResult.skipped.length > 0) {
-      log(`  ⚠ ${reqResult.skipped.length} required fields unmatched: ${reqResult.skipped.join(', ')}`);
+      log(`  ${reqResult.skipped.length} required fields unmatched: ${reqResult.skipped.join(', ')}`);
 
-      // Try Gemini for unmatched required fields
       if (geminiKey && reqResult.skipped.length > 0) {
         for (const fieldLabel of reqResult.skipped) {
           const answer = await askGemini(fieldLabel);
           if (answer) {
             await fillByLabel(page, fieldLabel.split(' ->')[0], answer);
-            log(`  🤖 Gemini answered: "${fieldLabel.slice(0, 40)}"`);
+            log(`  Gemini answered: "${fieldLabel.slice(0, 40)}"`);
           }
         }
       }
@@ -464,7 +609,11 @@ ${CV.name}`;
 
     // Check if all required fields are filled
     const unfilledRequired = await page.evaluate(() => {
-      const allLabels = [...document.querySelectorAll('label, p, span, div')];
+      const modal = document.querySelector(
+        '[role="dialog"], .modal, [data-modal], [data-controller*="modal"], [class*="modal"]'
+      ) || document;
+
+      const allLabels = [...modal.querySelectorAll('label, p, span, div')];
       const requiredLabels = allLabels.filter(l => {
         const text = l.textContent || '';
         return text.includes('*') && text.length > 3 && text.length < 200;
@@ -473,7 +622,6 @@ ${CV.name}`;
       const unfilled = [];
       for (const label of requiredLabels) {
         const text = label.textContent.trim().replace(/\*/g, '').trim().toLowerCase();
-        // Skip non-input required labels (like authorization section headers)
         if (text.includes('authorized') || text.includes('sponsorship') || text.includes('relocating')) continue;
 
         const forId = label.getAttribute('for');
@@ -495,41 +643,69 @@ ${CV.name}`;
     });
 
     if (unfilledRequired.length > 0) {
-      log(`  ⚠ cannot fill required fields — skipping: ${unfilledRequired.join(', ')}`);
+      log(`  cannot fill required fields -- skipping: ${unfilledRequired.join(', ')}`);
       return false;
     }
 
     await page.waitForTimeout(1000);
 
     if (DRY_RUN) {
-      log(`  🔍 DRY_RUN — would submit for ${job.title} at ${job.company}`);
+      log(`  DRY_RUN -- would submit for ${job.title} at ${job.company}`);
       state.seen.push(job.slug);
       return true;
     }
 
     // Submit
     const submitted = await page.evaluate(() => {
-      const btns = document.querySelectorAll('button[type="submit"], input[type="submit"], button');
+      const isMailto = (el) => (el.getAttribute('href') || '').startsWith('mailto:');
+      const isVisible = (el) => el.getClientRects().length > 0;
+
+      const modal = document.querySelector(
+        '[role="dialog"], .modal, [data-modal], [data-controller*="modal"], [class*="modal"]'
+      ) || document;
+
+      const btns = [...modal.querySelectorAll('button[type="submit"], input[type="submit"], button, a')];
+      const allBtns = [];
+
       for (const btn of btns) {
         const t = (btn.textContent || '').toLowerCase().trim();
-        if (t.includes('submit') || t.includes('send') || t.includes('apply') || t.includes('contact')) {
+        const vis = isVisible(btn);
+        allBtns.push({ tag: btn.tagName, text: t.slice(0, 50), type: btn.type || '', visible: vis });
+
+        if (!vis || isMailto(btn)) continue;
+
+        if (t.includes('submit') || t.includes('send') || t.includes('apply now') || t.includes('submit application')) {
           btn.click();
-          return t;
+          return { clicked: t, allBtns };
         }
       }
-      return null;
+
+      for (const btn of btns) {
+        if (btn.tagName === 'BUTTON' && btn.type === 'submit' && isVisible(btn) && !isMailto(btn)) {
+          const t = (btn.textContent || '').toLowerCase().trim();
+          btn.click();
+          return { clicked: t || 'submit', allBtns };
+        }
+      }
+
+      return { clicked: null, allBtns };
     });
 
-    if (submitted) {
-      log(`  ✓ submitted for ${job.title} at ${job.company}`);
+    if (submitted.clicked) {
+      log(`  submitted for ${job.title} at ${job.company}`);
       state.seen.push(job.slug);
+      try {
+        await page.goto(COMPANIES_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch (e) {
+        log(`  could not navigate back: ${e.message}`);
+      }
       return true;
     }
 
-    log('  ⚠ no submit button found');
+    log('  no submit button found');
     return false;
   } catch (err) {
-    log(`  ✗ error: ${err.message}`);
+    log(`  error: ${err.message}`);
     return false;
   }
 }
@@ -537,22 +713,35 @@ ${CV.name}`;
 // ── Main ─────────────────────────────────────────────────────
 async function run() {
   const state = loadState();
-  const remaining = MAX_APPLICATIONS - state.count;
-  if (remaining <= 0) {
-    log(`Daily cap reached (${state.count}/${MAX_APPLICATIONS}). Done.`);
+
+  if (!FORCE_MODE && state.weeklyCount >= YC_WEEKLY_LIMIT) {
+    log(`Weekly cap reached (${state.weeklyCount}/${YC_WEEKLY_LIMIT}). Done.`);
     return;
   }
 
-  log(`Starting. mode=${DRY_RUN ? 'DRY_RUN' : 'LIVE'} target=${remaining} applications`);
+  const remaining = YC_WEEKLY_LIMIT - state.weeklyCount;
+  log(`Starting. mode=${DRY_RUN ? 'DRY_RUN' : 'LIVE'} ${remaining} applications remaining this week`);
 
   const context = await launchBrowser();
   const page = context.pages()[0] || await context.newPage();
 
-  const jobs = await fetchJobs(page);
-  if (jobs.length === 0) {
-    log('No matching jobs found. Done.');
-    await context.close().catch(() => { });
-    return;
+  let jobs;
+  if (TEST_JOB_URL) {
+    const slugMatch = TEST_JOB_URL.match(/\/jobs\/(\d+)/);
+    jobs = [{
+      title: 'Test Job',
+      company: 'Test Company',
+      url: TEST_JOB_URL,
+      slug: slugMatch ? slugMatch[1] : 'test',
+    }];
+    log(`Test mode: applying to ${TEST_JOB_URL}`);
+  } else {
+    jobs = await fetchJobs(page);
+    if (jobs.length === 0) {
+      log('No matching jobs found. Done.');
+      await context.close().catch(() => { });
+      return;
+    }
   }
 
   log(`Processing ${jobs.length} jobs...`);
@@ -565,28 +754,33 @@ async function run() {
   let appliedCount = 0;
 
   for (const job of jobs) {
-    if (appliedCount >= remaining) {
-      log(`Daily cap reached. Stopping.`);
+    if (!FORCE_MODE && state.weeklyCount >= YC_WEEKLY_LIMIT) {
+      log(`Weekly cap reached (${state.weeklyCount}/${YC_WEEKLY_LIMIT}). Stopping.`);
       break;
     }
 
     const success = await applyToJob(page, job, state);
     if (success) {
       appliedCount++;
-      log(`==> ${appliedCount}/${remaining} this run`);
+      markApplied(state, job);
+      log(`==> ${appliedCount} applied this run | ${state.weeklyCount}/${YC_WEEKLY_LIMIT} this week`);
       saveState(state);
     }
 
     if (appliedCount < remaining) {
       const wait = 60_000 + Math.random() * 90_000;
       log(`Waiting ${Math.round(wait / 1000)}s...`);
-      await page.waitForTimeout(wait);
+      try {
+        await page.waitForTimeout(wait);
+      } catch (e) {
+        log(`  wait interrupted: ${e.message}`);
+        break;
+      }
     }
   }
 
-  state.count += appliedCount;
   saveState(state);
-  log(`Run complete. Applied to ${appliedCount} jobs. Total today: ${state.count}/${MAX_APPLICATIONS}`);
+  log(`Run complete. Applied to ${appliedCount} jobs. Weekly total: ${state.weeklyCount}/${YC_WEEKLY_LIMIT}`);
 
   if (!DRY_RUN && appliedCount > 0) {
     logToCSV({ role: 'YC Jobs', company: 'Various', url: COMPANIES_URL, skills: CV.skills.slice(0, 5), desc: `Applied to ${appliedCount} jobs` });

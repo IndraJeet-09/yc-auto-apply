@@ -16,7 +16,7 @@ systemctl --user enable "$SERVICE_NAME.timer"
 systemctl --user start "$SERVICE_NAME.timer"
 
 echo "Done! Timer installed and started."
-echo "Schedule: daily at 18:30 IST (9:00 AM ET / 3:00 PM CET)"
+echo "Schedule: weekly on Monday at 18:30 IST (9:00 AM ET / 3:00 PM CET)"
 echo ""
 echo "Commands:"
 echo "  systemctl --user status $SERVICE_NAME.timer    # check timer"
