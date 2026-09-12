@@ -111,20 +111,127 @@
     return null;
   }
 
-  function generateCoverLetter(company, role) {
-    return `Dear Hiring Manager,
+  function generateCoverLetter(company, role, jobText) {
+  const text = (jobText || '').toLowerCase();
 
-I am writing to express my strong interest in the ${role} position at ${company}. With ${CV.yearsExperience} years of experience in software development and a passion for building scalable, impactful products, I am excited about the opportunity to contribute to your team.
+  const skillMatches = CV.skills.filter(skill =>
+    text.includes(skill.toLowerCase())
+  );
 
-${CV.highlights[0] ? `For example, ${CV.highlights[0]}.` : ''}
+  const projectMatches = [];
 
-My technical expertise spans ${CV.skills.slice(0, 5).join(', ')}, and I thrive in fast-paced startup environments where I can make a direct impact. I am particularly drawn to ${company}'s mission and believe my background aligns well with your needs.
+  if (
+    text.includes('payment') ||
+    text.includes('fintech') ||
+    text.includes('fraud') ||
+    text.includes('transaction')
+  ) {
+    projectMatches.push(
+      'my UPI payment and fraud-detection platform, where I worked on transaction processing, PostgreSQL-backed workflows, idempotency, and fraud decision pipelines'
+    );
+  }
 
-I would welcome the opportunity to discuss how I can contribute to ${company}'s continued success.
+  if (
+    text.includes('websocket') ||
+    text.includes('real-time') ||
+    text.includes('realtime') ||
+    text.includes('real time')
+  ) {
+    projectMatches.push(
+      'my real-time systems work, where I have built interactive applications and worked with real-time data flows'
+    );
+  }
+
+  if (
+    text.includes('api') ||
+    text.includes('backend') ||
+    text.includes('fastapi') ||
+    text.includes('postgres') ||
+    text.includes('database')
+  ) {
+    projectMatches.push(
+      'my backend work with FastAPI and PostgreSQL, including improving business logic and database query performance'
+    );
+  }
+
+  if (
+    text.includes('react') ||
+    text.includes('next.js') ||
+    text.includes('frontend') ||
+    text.includes('typescript')
+  ) {
+    projectMatches.push(
+      'my production experience building features across React/Next.js and backend APIs'
+    );
+  }
+
+  if (
+    text.includes('ai') ||
+    text.includes('machine learning') ||
+    text.includes('llm') ||
+    text.includes('agent')
+  ) {
+    projectMatches.push(
+      'my work integrating AI into applications, including an AI-powered study planner using the Claude API'
+    );
+  }
+
+  const relevantSkills = skillMatches.slice(0, 5).join(', ');
+
+  let whyCompany =
+    `What particularly caught my attention about ${company} is the engineering problem space described in this role. `;
+
+  if (
+    text.includes('infrastructure') ||
+    text.includes('distributed') ||
+    text.includes('scal') ||
+    text.includes('systems')
+  ) {
+    whyCompany +=
+      'I am especially interested in the systems and infrastructure side of the product, because I enjoy understanding how software behaves beyond simply getting a feature to work.';
+  } else if (
+    text.includes('ai') ||
+    text.includes('agent')
+  ) {
+    whyCompany +=
+      'The focus on building practical software around AI and intelligent systems is particularly interesting to me because I enjoy experimenting with new technology and turning it into something usable.';
+  } else if (
+    text.includes('developer') ||
+    text.includes('sdk') ||
+    text.includes('api')
+  ) {
+    whyCompany +=
+      'The focus on developer-facing infrastructure and APIs stood out to me because I enjoy building software that other developers can actually use and build on.';
+  } else {
+    whyCompany +=
+      'The combination of the technical challenges and the opportunity to work in a startup environment is exactly the kind of environment I want to learn and contribute in.';
+  }
+
+  let experience =
+    projectMatches.length > 0
+      ? `My background connects well with that. ${projectMatches.slice(0, 2).join(' I have also worked on ')}.`
+      : `My recent work has involved shipping production features across React/Next.js and FastAPI, while also improving backend logic, database queries, and testing.`;
+
+  let curiosity =
+    `I also want to be transparent that I may not have worked with every technology in the stack yet. That is part of what attracts me to roles like this — I enjoy getting into unfamiliar systems, understanding how they work, and learning quickly rather than staying limited to technologies I already know.`;
+
+  return `Dear Hiring Team,
+
+I was genuinely interested in the ${role} opportunity at ${company} because the work described in the role connects with the kind of engineering problems I want to spend more time understanding and building.
+
+${whyCompany}
+
+${experience}
+
+${relevantSkills ? `Some of the technologies from the role that overlap with my current experience include ${relevantSkills}.` : ''}
+
+${curiosity}
+
+I would be excited to bring the experience I already have, learn from the problems your team is solving, and contribute wherever I can create real value.
 
 Best regards,
 ${CV.name}`;
-  }
+}
 
   // ── Form Filling ───────────────────────────────────────────
   function setReactInput(el, value) {
@@ -201,9 +308,11 @@ ${CV.name}`;
 
     try {
       window.location.href = jobUrl;
-      await sleep(3000 + Math.random() * 2000);
+await sleep(3000 + Math.random() * 2000);
 
-      const applyBtn = document.querySelector(
+const jobText = document.body.innerText || '';
+
+const applyBtn = document.querySelector((
         'a[href*="contact"], button:has-text("Apply"), a:has-text("Apply"), ' +
         '[data-controller="modal"] button, a[href*="apply"]'
       );
@@ -237,7 +346,7 @@ ${CV.name}`;
       await fillField(modal, 'website', CV.portfolio);
       await fillField(modal, 'portfolio', CV.portfolio);
 
-      const coverLetterText = generateCoverLetter(company, role);
+      const coverLetterText = generateCoverLetter(company, role,jobText);
       const clFilled = await fillField(modal, 'cover', coverLetterText)
         || await fillField(modal, 'message', coverLetterText)
         || await fillField(modal, 'message', coverLetterText);
@@ -269,10 +378,9 @@ ${CV.name}`;
       await sleep(1000);
 
       if (DRY_RUN) {
-        log(`  🔍 DRY_RUN — would submit application for ${role} at ${company}`);
-        appliedJobs.add(jobUrl);
-        return true;
-      }
+  log(`  🔍 DRY_RUN — would submit application for ${role} at ${company}`);
+  return false;
+}
 
       const submitBtn = modal.querySelector(
         'button[type="submit"], input[type="submit"], button:has-text("Submit"), ' +
